@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,17 +19,10 @@ DEFAULT_OUTPUT = REPO_ROOT / "news_diff_report.html"
 
 # Run this from the project folder with:
 # python3 scripts/diff_news_csv.py
-# That reads the default CSV in this repository and writes the HTML report to
-# news_diff_report.html in the project folder.
 #
-# To use different files, run:
+# To use different files:
 # python3 scripts/diff_news_csv.py --input "/full/path/to/input.csv" --output "/full/path/to/output.html"
-#
-# To see the available command-line options, run:
-# python3 scripts/diff_news_csv.py --help
 
-# This pattern keeps tags, spaces, words, and punctuation as separate pieces
-# so the report can show exactly what changed without flattening the sentence.
 TOKEN_PATTERN = re.compile(r"(<[^>]+?>|\s+|\w+|[^\w\s])", re.UNICODE)
 P_OPEN_PATTERN = re.compile(r"<p\b[^>]*>", re.IGNORECASE)
 P_CLOSE_PATTERN = re.compile(r"</p\s*>", re.IGNORECASE)
@@ -83,17 +75,8 @@ class RowResult:
     changed: bool
 
 
-def sanitize_href(href: str) -> str | None:
-    """Allow only regular web links in rendered source cells."""
-    parsed = urlparse(href)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return href
-    return None
-
-
 def normalize_display_text(text: str) -> str:
-    # Timeline iframes are removed everywhere so the report only shows article text.
-    # Paragraph tags are also flattened so each column uses the same spacing.
+    """Normalize text for Original and Final display, but keep HTML as visible text."""
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = TIMELINE_SECTION_PATTERN.sub("", normalized)
     normalized = IFRAME_BLOCK_PATTERN.sub("", normalized)
@@ -111,82 +94,12 @@ def normalize_display_text(text: str) -> str:
 
 
 def normalize_diff_text(text: str) -> str:
-    # Source reference boilerplate is ignored in the diff so the comparison stays
-    # focused on the article changes instead of the citation footer.
+    """Normalize text for diff logic."""
     normalized = normalize_display_text(text)
     normalized = SOURCE_STYLE_PATTERN.sub("", normalized)
     normalized = SOURCE_PARAGRAPH_PATTERN.sub("", normalized)
     normalized = SOURCE_EM_PATTERN.sub("", normalized)
     return EXCESS_NEWLINES_PATTERN.sub("\n\n", normalized).strip()
-
-
-class SafeSnippetRenderer(HTMLParser):
-    """Render snippets safely while keeping normal web links clickable."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
-        self.parts: list[str] = []
-        self.anchor_stack: list[bool] = []
-
-    # This turns article snippets into safe HTML. Plain text stays plain text,
-    # and only normal web links are kept as clickable links.
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "a":
-            self.parts.append(html.escape(self.get_starttag_text() or f"<{tag}>"))
-            return
-
-        href = ""
-        for name, value in attrs:
-            if name.lower() == "href" and value:
-                href = value
-                break
-
-        safe_href = sanitize_href(href)
-        if safe_href:
-            escaped_href = html.escape(safe_href, quote=True)
-            self.parts.append(
-                f'<a href="{escaped_href}" target="_blank" rel="noopener noreferrer">'
-            )
-            self.anchor_stack.append(True)
-            return
-
-        self.parts.append(html.escape(self.get_starttag_text() or "<a>"))
-        self.anchor_stack.append(False)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "a" and self.anchor_stack:
-            if self.anchor_stack.pop():
-                self.parts.append("</a>")
-            else:
-                self.parts.append("&lt;/a&gt;")
-            return
-
-        self.parts.append(html.escape(f"</{tag}>"))
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.parts.append(html.escape(self.get_starttag_text() or f"<{tag} />"))
-
-    def handle_data(self, data: str) -> None:
-        self.parts.append(html.escape(data))
-
-    def handle_entityref(self, name: str) -> None:
-        self.parts.append(f"&{name};")
-
-    def handle_charref(self, name: str) -> None:
-        self.parts.append(f"&#{name};")
-
-    def handle_comment(self, data: str) -> None:
-        self.parts.append(html.escape(f"<!--{data}-->"))
-
-    def handle_decl(self, decl: str) -> None:
-        self.parts.append(html.escape(f"<!{decl}>"))
-
-    def close(self) -> str:  # type: ignore[override]
-        super().close()
-        while self.anchor_stack:
-            if self.anchor_stack.pop():
-                self.parts.append("</a>")
-        return "".join(self.parts)
 
 
 class VisibleTextExtractor(HTMLParser):
@@ -226,7 +139,6 @@ class VisibleTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
 
-    # Block-level tags need separators so adjacent paragraphs do not merge into one word.
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() in self.BLOCK_TAGS:
             self.parts.append("\n")
@@ -245,26 +157,16 @@ class VisibleTextExtractor(HTMLParser):
         return EXCESS_NEWLINES_PATTERN.sub("\n\n", joined).strip()
 
 
-def render_text(text: str) -> str:
-    text = normalize_display_text(text)
-    renderer = SafeSnippetRenderer()
-    renderer.feed(text)
-    return renderer.close()
-
-
 def tokenize(text: str) -> list[str]:
     text = normalize_diff_text(text)
     return TOKEN_PATTERN.findall(text)
 
 
 def canonicalize_diff_token(token: str) -> str:
-    # Curly apostrophes should not count as content edits in the diff view.
     return token.replace("’", "'")
 
 
 def canonicalize_tag_token(token: str) -> str:
-    # Tag attributes often change without affecting what readers see, so the
-    # diff only compares the tag shape itself.
     match = re.match(r"<\s*(/?)\s*([a-zA-Z0-9:-]+)", token)
     if not match:
         return token
@@ -275,14 +177,10 @@ def canonicalize_tag_token(token: str) -> str:
 
 
 def normalize_display_diff_markup(text: str) -> str:
-    # Entity-only text changes like R&D versus R&amp;D should compare the same
-    # while still letting the diff column render HTML tags as code.
     return html.unescape(normalize_diff_text(text))
 
 
 def build_display_diff_tokens(text: str) -> list[tuple[str, str]]:
-    # The diff view still shows HTML code, but comparison ignores tag-attribute
-    # noise and apostrophe style changes.
     tokens = TOKEN_PATTERN.findall(normalize_display_diff_markup(text))
     display_tokens: list[tuple[str, str]] = []
     for token in tokens:
@@ -295,8 +193,6 @@ def build_display_diff_tokens(text: str) -> list[tuple[str, str]]:
 
 
 def extract_visible_diff_text(text: str) -> str:
-    # Diff decisions should follow what a reader can actually see, not HTML tag
-    # formatting or attribute changes that leave the visible copy untouched.
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = TIMELINE_SECTION_PATTERN.sub("", normalized)
     normalized = IFRAME_BLOCK_PATTERN.sub("", normalized)
@@ -320,7 +216,6 @@ def tokenize_visible_diff_text(text: str) -> list[str]:
 
 
 def extract_news_body_text(body: str) -> str:
-    # Word counts only include visible news-body text before the food-for-thought section.
     match = FOOD_FOR_THOUGHT_WRAPPER_PATTERN.search(body)
     if match:
         body = body[: match.start()]
@@ -340,10 +235,17 @@ def extract_news_body_text(body: str) -> str:
 
 
 def count_news_words(_headline: str, body: str) -> int:
-    # News word counts only cover the article body before the food-for-thought
-    # section starts. Headlines are intentionally excluded.
     news_body_text = extract_news_body_text(body)
     return len(re.findall(r"\w+", news_body_text, re.UNICODE))
+
+
+def render_plain_text_block(text: str) -> str:
+    """
+    Escape everything so it displays as plain text only.
+    This prevents HTML, images, iframes, and links from rendering.
+    """
+    normalized = normalize_display_text(text)
+    return html.escape(normalized)
 
 
 def render_article_cell(headline: str, body: str, news_word_count: int) -> str:
@@ -351,21 +253,20 @@ def render_article_cell(headline: str, body: str, news_word_count: int) -> str:
     body_text = normalize_display_text(body)
     parts: list[str] = []
 
-    # This badge makes it clear that the count only covers the news section.
     parts.append(
         '<div class="article-stats">'
         f'<span class="word-count">News words: {news_word_count}</span>'
         "</div>"
     )
 
-    # The headline is shown separately so it can be bold without changing the
-    # spacing used for the body copy underneath it.
     if headline_text:
         parts.append(
-            f'<div class="article-headline">{render_diff_tokens(tokenize(headline_text))}</div>'
+            f'<div class="article-headline">{render_plain_text_block(headline_text)}</div>'
         )
     if body_text:
-        parts.append(f'<div class="article-body">{render_diff_tokens(tokenize(body_text))}</div>')
+        parts.append(
+            f'<div class="article-body">{render_plain_text_block(body_text)}</div>'
+        )
 
     return "".join(parts)
 
@@ -373,16 +274,12 @@ def render_article_cell(headline: str, body: str, news_word_count: int) -> str:
 def render_diff_article_cell(headline: str, body: str) -> str:
     parts: list[str] = []
 
-    # The diff column uses an invisible spacer so the headline and first body
-    # line start at the same vertical position as the source columns.
     parts.append(
         '<div class="article-stats article-stats-spacer" aria-hidden="true">'
         '<span class="word-count">News words: 000</span>'
         "</div>"
     )
 
-    # The diff headline uses the same structure as the source columns so the
-    # first line stands out as the headline instead of blending into the body.
     if headline:
         parts.append(f'<div class="article-headline">{headline}</div>')
     if body:
@@ -405,8 +302,6 @@ def build_diff_html(original: str, final: str) -> tuple[str, bool]:
     original_tokens = tokenize_visible_diff_text(original)
     final_tokens = tokenize_visible_diff_text(final)
 
-    # If the reader-visible text is the same, markup-only drift should not be
-    # shown as an edit in the report.
     if original_tokens == final_tokens:
         final_display_tokens = build_display_diff_tokens(final)
         return render_diff_tokens([token for _, token in final_display_tokens]), False
@@ -468,7 +363,6 @@ def build_rows(csv_path: Path) -> tuple[list[RowResult], dict[str, int]]:
             original_content = row.get("content", "") or ""
             final_content = row.get("final_content", "") or ""
 
-            # This report only includes rows that have a final version to compare against.
             if not normalize_display_text(final_content):
                 continue
 
@@ -477,6 +371,7 @@ def build_rows(csv_path: Path) -> tuple[list[RowResult], dict[str, int]]:
             final_news_words = count_news_words(final_headline, final_content)
             total_original_news_words += original_news_words
             total_final_news_words += final_news_words
+
             headline_diff_html, headline_changed = build_diff_html(
                 original_headline, final_headline
             )
@@ -508,7 +403,9 @@ def build_rows(csv_path: Path) -> tuple[list[RowResult], dict[str, int]]:
     average_original_news_words = (
         total_original_news_words / processed_rows if processed_rows else 0.0
     )
-    average_final_news_words = total_final_news_words / processed_rows if processed_rows else 0.0
+    average_final_news_words = (
+        total_final_news_words / processed_rows if processed_rows else 0.0
+    )
 
     summary = {
         "total_rows": total_rows,
@@ -724,14 +621,12 @@ def render_report(rows: list[RowResult], summary: dict[str, int], source_path: P
       margin-bottom: 6px;
     }}
 
-    .meta-link a,
-    .content-cell a {{
+    .meta-link a {{
       color: #0f5b84;
       text-decoration: none;
     }}
 
-    .meta-link a:hover,
-    .content-cell a:hover {{
+    .meta-link a:hover {{
       text-decoration: underline;
     }}
 
@@ -768,12 +663,17 @@ def render_report(rows: list[RowResult], summary: dict[str, int], source_path: P
       font-size: 1rem;
       line-height: 1.45;
       margin: 0 0 calc(0.45rem + var(--headline-extra-gap, 0px));
-      white-space: normal;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }}
 
     .article-body {{
       margin: 0;
       color: #334155;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }}
 
     .diff-cell del {{
@@ -907,8 +807,8 @@ def render_report(rows: list[RowResult], summary: dict[str, int], source_path: P
       <p class="subtitle">
         Comparing the combined original headline and content against the combined
         final headline and content from <code>{source_name}</code>.
-        <code>&lt;p&gt;</code> tags are ignored, and news word counts stop before
-        <code>food-for-thought-wrapper</code>.
+        Original and Final are displayed as plain text so HTML does not render.
+        The Diff column keeps edit highlighting.
       </p>
       <div class="summary">
         <div class="summary-card"><strong>{summary['total_rows']}</strong>Total CSV rows</div>
@@ -984,7 +884,7 @@ def render_report(rows: list[RowResult], summary: dict[str, int], source_path: P
           sourceCells.forEach((cell) => {{
             const headline = cell.querySelector('.article-headline');
             const body = cell.querySelector('.article-body');
-            if (!headline || !body) {{
+            if (!headline or !body) {{
               return;
             }}
 
